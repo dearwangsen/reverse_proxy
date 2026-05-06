@@ -131,6 +131,7 @@ def handle_http_request(ctrl_sock, send_lock, header: dict, body: bytes):
                 verify=False,
                 allow_redirects=False,
                 stream=True,
+                proxies={"http": None, "https": None},  # bypass Windows system proxy
             )
             resp_body = resp.content
             resp_headers = dict(resp.headers)
@@ -138,6 +139,13 @@ def handle_http_request(ctrl_sock, send_lock, header: dict, body: bytes):
             reason = resp.reason or ""
         else:
             resp_body, resp_headers, status, reason = _urllib_request(method, url, req_headers, body)
+
+        # requests decompresses gzip and dechunks automatically;
+        # strip these headers so the downstream client gets plain bytes
+        for h in ("Transfer-Encoding", "Content-Encoding",
+                  "transfer-encoding", "content-encoding"):
+            resp_headers.pop(h, None)
+        resp_headers["Content-Length"] = str(len(resp_body))
 
         with send_lock:
             send_msg(
