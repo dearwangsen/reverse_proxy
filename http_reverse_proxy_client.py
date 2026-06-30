@@ -48,6 +48,21 @@ def send_msg(sock, header: dict, body: bytes = b"") -> None:
     sock.sendall(frame)
 
 
+def try_send_msg(sock, send_lock, header: dict, body: bytes = b"") -> bool:
+    try:
+        with send_lock:
+            send_msg(sock, header, body)
+        return True
+    except OSError as e:
+        log.warning(
+            "Control send failed type=%s id=%s: %s",
+            header.get("type"),
+            header.get("id"),
+            e,
+        )
+        return False
+
+
 def recv_msg(sock):
     raw = _recv_exactly(sock, 4)
     if raw is None:
@@ -147,35 +162,28 @@ def handle_http_request(ctrl_sock, send_lock, header: dict, body: bytes):
             resp_headers.pop(h, None)
         resp_headers["Content-Length"] = str(len(resp_body))
 
-        with send_lock:
-            send_msg(
-                ctrl_sock,
-                {
-                    "type": "http_response",
-                    "id": req_id,
-                    "status": status,
-                    "reason": reason,
-                    "headers": resp_headers,
-                    "body_len": len(resp_body),
-                },
-                resp_body,
-            )
+        resp_header = {
+            "type": "http_response",
+            "id": req_id,
+            "status": status,
+            "reason": reason,
+            "headers": resp_headers,
+            "body_len": len(resp_body),
+        }
+        response_body = resp_body
     except Exception as e:
-        log.warning("HTTP request failed: %s", e)
-        err_body = str(e).encode()
-        with send_lock:
-            send_msg(
-                ctrl_sock,
-                {
-                    "type": "http_response",
-                    "id": req_id,
-                    "status": 502,
-                    "reason": "Bad Gateway",
-                    "headers": {"Content-Length": str(len(err_body))},
-                    "body_len": len(err_body),
-                },
-                err_body,
-            )
+        log.warning("HTTP request failed id=%s: %s", req_id, e)
+        response_body = str(e).encode()
+        resp_header = {
+            "type": "http_response",
+            "id": req_id,
+            "status": 502,
+            "reason": "Bad Gateway",
+            "headers": {"Content-Length": str(len(response_body))},
+            "body_len": len(response_body),
+        }
+
+    try_send_msg(ctrl_sock, send_lock, resp_header, response_body)
 
 
 def _urllib_request(method, url, headers, body):
@@ -203,15 +211,16 @@ def handle_connect(ctrl_sock, send_lock, tunnels: TunnelState, header: dict):
 
     try:
         remote = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+        remote.settimeout(None)
     except OSError as e:
         log.warning("CONNECT %s:%d failed: %s", host, port, e)
-        with send_lock:
-            send_msg(ctrl_sock, {"type": "connect_ack", "id": req_id, "success": False, "error": str(e)})
+        try_send_msg(ctrl_sock, send_lock, {"type": "connect_ack", "id": req_id, "success": False, "error": str(e)})
         return
 
     tunnels.add(req_id, remote)
-    with send_lock:
-        send_msg(ctrl_sock, {"type": "connect_ack", "id": req_id, "success": True})
+    if not try_send_msg(ctrl_sock, send_lock, {"type": "connect_ack", "id": req_id, "success": True}):
+        tunnels.remove(req_id)
+        return
 
     # remote → server relay
     def relay_remote_to_server():
@@ -220,17 +229,13 @@ def handle_connect(ctrl_sock, send_lock, tunnels: TunnelState, header: dict):
                 chunk = remote.recv(BUFSIZE)
                 if not chunk:
                     break
-                with send_lock:
-                    send_msg(ctrl_sock, {"type": "data", "id": req_id, "body_len": len(chunk)}, chunk)
+                if not try_send_msg(ctrl_sock, send_lock, {"type": "data", "id": req_id, "body_len": len(chunk)}, chunk):
+                    break
         except OSError:
             pass
         finally:
             tunnels.remove(req_id)
-            try:
-                with send_lock:
-                    send_msg(ctrl_sock, {"type": "close", "id": req_id})
-            except OSError:
-                pass
+            try_send_msg(ctrl_sock, send_lock, {"type": "close", "id": req_id})
 
     threading.Thread(target=relay_remote_to_server, daemon=True).start()
 
@@ -259,6 +264,7 @@ def run(server_host: str, control_port: int):
         try:
             log.info("Connecting to %s:%d ...", server_host, control_port)
             ctrl_sock = socket.create_connection((server_host, control_port), timeout=10)
+            ctrl_sock.settimeout(None)
             log.info("Connected to Linux server")
             backoff = 1
 
@@ -294,8 +300,7 @@ def run(server_host: str, control_port: int):
                     handle_close(tunnels, header)
 
                 elif msg_type == "ping":
-                    with send_lock:
-                        send_msg(ctrl_sock, {"type": "pong"})
+                    try_send_msg(ctrl_sock, send_lock, {"type": "pong"})
 
         except (OSError, ConnectionRefusedError) as e:
             log.warning("Connection error: %s", e)

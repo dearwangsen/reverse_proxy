@@ -4,7 +4,7 @@ HTTP Reverse Proxy Server - runs on Linux.
 
 Listens on two ports:
   - control_port (default 7000): accepts the persistent connection from the Windows client
-  - proxy_port   (default 8080): accepts HTTP proxy requests from local apps (curl, wget, etc.)
+  - proxy_port   (default 9000): accepts HTTP proxy requests from local apps (curl, wget, etc.)
 
 HTTP and HTTPS (via CONNECT) are both supported.
 """
@@ -350,8 +350,9 @@ def heartbeat(state: ProxyState):
         if state.connected.is_set():
             try:
                 state.send({"type": "ping"})
-            except OSError:
-                pass
+            except OSError as e:
+                log.warning("Heartbeat failed: %s", e)
+                state.clear_client()
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +362,7 @@ def heartbeat(state: ProxyState):
 def main():
     parser = argparse.ArgumentParser(description="HTTP Reverse Proxy Server (Linux side)")
     parser.add_argument("--control-port", type=int, default=7000, help="Port for Windows client to connect (default: 7000)")
-    parser.add_argument("--proxy-port", type=int, default=8080, help="Local HTTP proxy port for apps (default: 8080)")
+    parser.add_argument("--proxy-port", type=int, default=9000, help="Local HTTP proxy port for apps (default: 9000)")
     parser.add_argument("--bind", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     args = parser.parse_args()
 
