@@ -10,11 +10,13 @@ HTTP and HTTPS (via CONNECT) are both supported.
 """
 
 import argparse
+import base64
 import json
 import logging
 import socket
 import struct
 import threading
+from urllib.parse import urlsplit
 import uuid
 
 logging.basicConfig(
@@ -131,14 +133,7 @@ def control_reader(state: ProxyState):
             msg_type = header.get("type")
             msg_id = header.get("id")
 
-            if msg_type == "http_response":
-                entry = state.pending.get(msg_id)
-                if entry:
-                    entry["response"] = header
-                    entry["body"] = body
-                    entry["event"].set()
-
-            elif msg_type == "connect_ack":
+            if msg_type == "connect_ack":
                 entry = state.pending.get(msg_id)
                 if entry:
                     entry["response"] = header
@@ -204,77 +199,100 @@ def _handle_proxy_conn(conn: socket.socket, addr, state: ProxyState):
     if len(parts) < 2:
         return
     method, target = parts[0], parts[1]
-
-    headers = {}
-    for line in lines[1:]:
-        if ": " in line:
-            k, _, v = line.partition(": ")
-            headers[k] = v
+    version = parts[2] if len(parts) >= 3 else "HTTP/1.1"
 
     if not state.connected.is_set():
         _send_http_error(conn, 503, "No client connected")
         return
 
     if method.upper() == "CONNECT":
-        _handle_connect(conn, target, headers, state)
+        _handle_connect(conn, target, state)
     else:
-        _handle_http(conn, method, target, headers, leftover, state)
+        _handle_http(conn, method, target, version, lines[1:], leftover, state)
 
 
-def _handle_http(conn, method, url, headers, leftover, state: ProxyState):
-    content_length = int(headers.get("Content-Length", 0))
-    body = leftover
-    while len(body) < content_length:
-        chunk = conn.recv(BUFSIZE)
-        if not chunk:
-            break
-        body += chunk
+def build_http_origin_request(method, target, version, raw_header_lines, first_body=b""):
+    parsed = urlsplit(target)
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError("HTTP proxy requests must use an absolute URL")
+    if parsed.scheme.lower() != "http":
+        raise ValueError(f"Unsupported proxy URL scheme: {parsed.scheme}")
 
-    req_id = uuid.uuid4().hex
-    event = threading.Event()
-    state.pending[req_id] = {"event": event, "response": None, "body": b"", "error": False}
+    host = parsed.hostname
+    port = parsed.port or 80
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
 
+    skip_headers = {
+        "proxy-connection",
+        "proxy-authorization",
+        "connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "upgrade",
+    }
+    output_headers = []
+    has_host = False
+    has_auth = False
+    for line in raw_header_lines:
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        value = value.lstrip()
+        lower = key.lower()
+        if lower in skip_headers:
+            continue
+        if lower == "host":
+            value = host if port == 80 else f"{host}:{port}"
+            has_host = True
+        elif lower == "authorization":
+            has_auth = True
+        output_headers.append((key, value))
+
+    if not has_host:
+        output_headers.insert(0, ("Host", host if port == 80 else f"{host}:{port}"))
+    if parsed.username and not has_auth:
+        userinfo = parsed.username
+        if parsed.password is not None:
+            userinfo += ":" + parsed.password
+        token = base64.b64encode(userinfo.encode()).decode()
+        output_headers.append(("Authorization", f"Basic {token}"))
+    output_headers.append(("Connection", "close"))
+
+    request = f"{method} {path} {version}\r\n"
+    request += "".join(f"{key}: {value}\r\n" for key, value in output_headers)
+    return host, port, request.encode() + b"\r\n" + first_body
+
+
+def _handle_http(conn, method, url, version, raw_header_lines, leftover, state: ProxyState):
     try:
-        state.send(
-            {
-                "type": "http_request",
-                "id": req_id,
-                "method": method,
-                "url": url,
-                "headers": headers,
-                "body_len": len(body),
-            },
-            body,
+        host, port, initial_data = build_http_origin_request(
+            method,
+            url,
+            version,
+            raw_header_lines,
+            leftover,
         )
-    except OSError as e:
-        state.pending.pop(req_id, None)
-        _send_http_error(conn, 502, str(e))
+    except ValueError as e:
+        _send_http_error(conn, 400, str(e))
         return
 
-    triggered = event.wait(timeout=TIMEOUT)
-    entry = state.pending.pop(req_id, {})
-
-    if not triggered or entry.get("error"):
-        _send_http_error(conn, 504 if not triggered else 502, "Gateway error")
-        return
-
-    resp = entry["response"]
-    resp_body = entry["body"]
-    status = resp.get("status", 502)
-    resp_headers = resp.get("headers", {})
-
-    status_line = f"HTTP/1.1 {status} {resp.get('reason', '')}\r\n"
-    header_lines = "".join(f"{k}: {v}\r\n" for k, v in resp_headers.items())
-    conn.sendall((status_line + header_lines + "\r\n").encode() + resp_body)
+    _open_tunnel_and_relay(conn, host, port, state, initial_data=initial_data, send_established=False)
 
 
-def _handle_connect(conn, target, headers, state: ProxyState):
+def _handle_connect(conn, target, state: ProxyState):
     if ":" in target:
         host, port_str = target.rsplit(":", 1)
         port = int(port_str)
     else:
         host, port = target, 443
 
+    _open_tunnel_and_relay(conn, host, port, state, initial_data=b"", send_established=True)
+
+
+def _open_tunnel_and_relay(conn, host, port, state: ProxyState, initial_data=b"", send_established=False):
     req_id = uuid.uuid4().hex
     event = threading.Event()
     state.pending[req_id] = {"event": event, "response": None, "error": False}
@@ -289,31 +307,30 @@ def _handle_connect(conn, target, headers, state: ProxyState):
     triggered = event.wait(timeout=TIMEOUT)
     entry = state.pending.pop(req_id, {})
 
-    if not triggered or entry.get("error") or not entry["response"].get("success"):
+    if not triggered or entry.get("error") or not entry.get("response", {}).get("success"):
         reason = "" if not entry.get("response") else entry["response"].get("error", "")
-        _send_http_error(conn, 502, reason or "Connect failed")
+        _send_http_error(conn, 502 if triggered else 504, reason or "Connect failed")
         return
 
-    conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+    if send_established:
+        conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
     with state.tunnels_lock:
         state.tunnels[req_id] = conn
 
-    # Forward app→client
-    def forward_app_to_client():
-        try:
-            while True:
-                chunk = conn.recv(BUFSIZE)
-                if not chunk:
-                    break
-                try:
-                    state.send({"type": "data", "id": req_id, "body_len": len(chunk)}, chunk)
-                except OSError:
-                    break
-        finally:
-            _send_tunnel_close(state, req_id)
-
-    threading.Thread(target=forward_app_to_client, daemon=True).start()
+    try:
+        if initial_data:
+            state.send({"type": "data", "id": req_id, "body_len": len(initial_data)}, initial_data)
+        while True:
+            chunk = conn.recv(BUFSIZE)
+            if not chunk:
+                break
+            try:
+                state.send({"type": "data", "id": req_id, "body_len": len(chunk)}, chunk)
+            except OSError:
+                break
+    finally:
+        _send_tunnel_close(state, req_id)
 
 
 def _send_tunnel_close(state: ProxyState, tunnel_id: str):

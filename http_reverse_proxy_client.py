@@ -3,30 +3,18 @@
 HTTP Reverse Proxy Client - runs on Windows.
 
 Connects to the Linux server's control port, receives forwarded HTTP/HTTPS
-requests, executes them against the company intranet, and returns responses.
+TCP tunnel requests, opens them against the company intranet, and relays bytes.
 
 Auto-reconnects on disconnect with exponential backoff.
-
-Dependencies: requests (pip install requests)  — used for HTTP/HTTPS handling.
 """
 
 import argparse
 import json
 import logging
 import socket
-import ssl
 import struct
 import threading
 import time
-import uuid
-
-try:
-    import requests
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    HAS_REQUESTS = True
-except ImportError:
-    HAS_REQUESTS = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,88 +108,6 @@ class TunnelState:
                 pass
 
 
-# ---------------------------------------------------------------------------
-# Request handlers
-# ---------------------------------------------------------------------------
-
-def handle_http_request(ctrl_sock, send_lock, header: dict, body: bytes):
-    req_id = header["id"]
-    method = header.get("method", "GET")
-    url = header.get("url", "")
-    req_headers = header.get("headers", {})
-    # strip hop-by-hop proxy headers
-    for h in ("Proxy-Connection", "Proxy-Authorization", "Transfer-Encoding"):
-        req_headers.pop(h, None)
-
-    log.info("HTTP %s %s", method, url)
-
-    try:
-        if HAS_REQUESTS:
-            resp = requests.request(
-                method,
-                url,
-                headers=req_headers,
-                data=body or None,
-                timeout=30,
-                verify=False,
-                allow_redirects=False,
-                stream=True,
-                proxies={"http": None, "https": None},  # bypass Windows system proxy
-            )
-            resp_body = resp.content
-            resp_headers = dict(resp.headers)
-            status = resp.status_code
-            reason = resp.reason or ""
-        else:
-            resp_body, resp_headers, status, reason = _urllib_request(method, url, req_headers, body)
-
-        # requests decompresses gzip and dechunks automatically;
-        # strip these headers so the downstream client gets plain bytes
-        for h in ("Transfer-Encoding", "Content-Encoding",
-                  "transfer-encoding", "content-encoding"):
-            resp_headers.pop(h, None)
-        resp_headers["Content-Length"] = str(len(resp_body))
-
-        resp_header = {
-            "type": "http_response",
-            "id": req_id,
-            "status": status,
-            "reason": reason,
-            "headers": resp_headers,
-            "body_len": len(resp_body),
-        }
-        response_body = resp_body
-    except Exception as e:
-        log.warning("HTTP request failed id=%s: %s", req_id, e)
-        response_body = str(e).encode()
-        resp_header = {
-            "type": "http_response",
-            "id": req_id,
-            "status": 502,
-            "reason": "Bad Gateway",
-            "headers": {"Content-Length": str(len(response_body))},
-            "body_len": len(response_body),
-        }
-
-    try_send_msg(ctrl_sock, send_lock, resp_header, response_body)
-
-
-def _urllib_request(method, url, headers, body):
-    import urllib.request
-    req = urllib.request.Request(url, data=body or None, headers=headers, method=method)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
-            resp_body = r.read()
-            resp_headers = dict(r.headers)
-            return resp_body, resp_headers, r.status, r.reason
-    except urllib.error.HTTPError as e:
-        resp_body = e.read()
-        return resp_body, dict(e.headers), e.code, e.reason
-
-
 def handle_connect(ctrl_sock, send_lock, tunnels: TunnelState, header: dict):
     req_id = header["id"]
     host = header["host"]
@@ -279,14 +185,7 @@ def run(server_host: str, control_port: int):
 
                 msg_type = header.get("type")
 
-                if msg_type == "http_request":
-                    threading.Thread(
-                        target=handle_http_request,
-                        args=(ctrl_sock, send_lock, header, body),
-                        daemon=True,
-                    ).start()
-
-                elif msg_type == "connect":
+                if msg_type == "connect":
                     threading.Thread(
                         target=handle_connect,
                         args=(ctrl_sock, send_lock, tunnels, header),
@@ -324,9 +223,6 @@ def main():
     parser.add_argument("server", help="Linux server hostname or IP")
     parser.add_argument("--control-port", type=int, default=7000, help="Control port on Linux server (default: 7000)")
     args = parser.parse_args()
-
-    if not HAS_REQUESTS:
-        log.warning("'requests' library not found, falling back to urllib (HTTPS may have issues)")
 
     run(args.server, args.control_port)
 

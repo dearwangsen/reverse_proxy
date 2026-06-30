@@ -26,8 +26,8 @@
 设计灵感来自 [frp](https://github.com/fatedier/frp)：
 
 - **Windows client** 主动连接 Linux server，建立持久 TCP 控制通道。
-- Linux 应用向本地代理端口发起 HTTP/HTTPS 请求，server 通过控制通道将请求转发给 Windows。
-- Windows client 对内网执行实际请求，将响应原路返回。
+- Linux 应用向本地代理端口发起 HTTP/HTTPS 请求，server 通过控制通道要求 Windows client 连接目标主机。
+- 请求体和响应体都按原始字节流双向转发，因此 `git clone`、`git push` 这类大文件或长时间传输不需要完整缓存到内存。
 - 多个并发请求通过唯一 request ID 在同一条控制连接上多路复用。
 
 ## 功能特性
@@ -37,15 +37,14 @@
 - 单条持久控制连接 + request ID 多路复用
 - 客户端断线自动重连（指数退避，最长 60s）
 - 心跳保活
-- 服务端零依赖（Python 3.6+ 标准库）
-- 客户端推荐安装 `requests` 库以获得更好的 HTTPS 支持
+- 两端零依赖（Python 3.6+ 标准库）
 
 ## 环境要求
 
 | 端 | 要求 |
 |----|------|
 | 服务端（Linux） | Python 3.6+ |
-| 客户端（Windows） | Python 3.6+，`pip install requests` |
+| 客户端（Windows） | Python 3.6+ |
 
 ## 快速开始
 
@@ -62,7 +61,6 @@ python3 http_reverse_proxy_server.py
 **2. Windows 上启动客户端：**
 
 ```cmd
-pip install requests
 python http_reverse_proxy_client.py <linux服务器IP>
 ```
 
@@ -114,9 +112,7 @@ r = requests.get("http://internal.example.com/api", proxies=proxies)
 
 | 消息类型 | 方向 | 说明 |
 |---|---|---|
-| `http_request` | Server → Client | 普通 HTTP 请求 |
-| `http_response` | Client → Server | HTTP 响应 |
-| `connect` | Server → Client | 建立 HTTPS CONNECT 隧道 |
+| `connect` | Server → Client | 建立目标 TCP 连接 |
 | `connect_ack` | Client → Server | 隧道建立结果 |
 | `data` | 双向 | 隧道原始字节流 |
 | `close` | 双向 | 关闭指定隧道 |
@@ -125,9 +121,8 @@ r = requests.get("http://internal.example.com/api", proxies=proxies)
 ## 注意事项
 
 - 服务端同一时间只接受**一个** client 连接。
-- HTTPS 流量透明隧道转发，TLS 在内网服务器端终止，代理不解密。
-- 客户端自动绕过 Windows 系统代理（`proxies={"http": None, "https": None}`），确保直连内网。
-- 响应压缩（gzip/deflate）由客户端透明处理，下游调用方始终收到原始字节。
+- HTTP 和 HTTPS 流量都透明隧道转发，TLS 在内网服务器端终止，代理不解密。
+- 普通 HTTP 代理请求会从 absolute-form 改写为发往上游的 origin-form，随后请求体和响应体按原始字节流转发。
 
 ## 许可证
 

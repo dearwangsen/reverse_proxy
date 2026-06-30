@@ -30,8 +30,8 @@ Linux machine needs to access the company intranet, but only the Windows machine
 
 | Script | Runs on | Role |
 |--------|---------|------|
-| `http_reverse_proxy_server.py` | Linux | Proxy port + control port listener; forwards requests to Windows |
-| `http_reverse_proxy_client.py` | Windows | Connects to Linux control port; executes actual HTTP/HTTPS requests |
+| `http_reverse_proxy_server.py` | Linux | Proxy port + control port listener; rewrites HTTP proxy requests and relays raw bytes |
+| `http_reverse_proxy_client.py` | Windows | Connects to Linux control port; opens target TCP connections and relays raw bytes |
 
 ## Wire Protocol
 
@@ -49,25 +49,21 @@ All messages on the control channel use a length-prefixed framing:
 
 | `type` | Direction | Purpose |
 |--------|-----------|---------|
-| `http_request` | Server → Client | Plain HTTP request (GET/POST/etc.) |
-| `http_response` | Client → Server | HTTP response |
-| `connect` | Server → Client | Request HTTPS CONNECT tunnel |
+| `connect` | Server → Client | Request target TCP connection |
 | `connect_ack` | Client → Server | Tunnel established (or failed) |
-| `data` | Bidirectional | Raw bytes for an active CONNECT tunnel |
+| `data` | Bidirectional | Raw bytes for an active tunnel |
 | `close` | Bidirectional | Close a specific tunnel by id |
 | `ping` / `pong` | Bidirectional | Heartbeat keepalive |
 
-### Example: HTTP Request Message
+### Plain HTTP Flow
 
-```json
-{
-  "type": "http_request",
-  "id": "a1b2c3",
-  "method": "GET",
-  "url": "http://internal.corp.com/api",
-  "headers": {"Host": "internal.corp.com"},
-  "body_len": 0
-}
+```
+App  →  GET http://internal.corp.com/api HTTP/1.1
+Server rewrites request line to:
+        GET /api HTTP/1.1
+Server  →  {type: "connect", id: "x1", host: "internal.corp.com", port: 80}
+          ←  {type: "connect_ack", id: "x1", success: true}
+App  ↔  [raw HTTP bytes via data messages, id="x1"]  ↔  Client  ↔  internal.corp.com:80
 ```
 
 ### HTTPS (HTTP CONNECT) Flow
@@ -91,19 +87,19 @@ main thread
   └── listen for app connections on proxy port :8080
         └── per-connection thread
               ├── parse HTTP or CONNECT request
+              ├── for plain HTTP, rewrite absolute-form to origin-form
               ├── assign request id, register pending_requests[id] = Event()
-              ├── send message on control channel (with send_lock)
-              ├── event.wait(timeout=30s)
-              └── write response to app socket
+              ├── send connect message on control channel (with send_lock)
+              ├── wait for connect_ack
+              └── relay app bytes to client while control_reader relays client bytes to app
 ```
 
 ### Client (Windows)
 
 ```
 main thread  (reads control channel messages)
-  ├── http_request  →  worker thread: requests.request() → send http_response
-  ├── connect       →  worker thread: connect to intranet, send connect_ack, bidirectional relay via data messages
-  └── data / close  →  dispatch to active tunnel thread by id
+  ├── connect       →  worker thread: connect to intranet, send connect_ack, relay remote bytes via data messages
+  └── data / close  →  dispatch to active tunnel socket by id
 ```
 
 ### Key Data Structures (Server)
@@ -112,8 +108,8 @@ main thread  (reads control channel messages)
 control_sock: socket           # persistent connection to Windows
 send_lock: threading.Lock      # serialize writes to control channel
 
-pending: dict[str, dict]       # id → {event, response_headers, response_body}
-tunnels: dict[str, socket]     # id → app-side socket (for CONNECT tunnels)
+pending: dict[str, dict]       # id → {event, connect_ack}
+tunnels: dict[str, socket]     # id → app-side socket
 ```
 
 ## Error Handling
@@ -121,8 +117,8 @@ tunnels: dict[str, socket]     # id → app-side socket (for CONNECT tunnels)
 | Scenario | Behavior |
 |----------|----------|
 | Windows client disconnects | Server wakes all pending events with 502, waits for reconnect |
-| Request timeout (30s) | Server returns 504, removes pending entry |
-| Intranet request fails | Client sends `http_response {status: 502, body: error}` |
+| Target connect timeout | Server returns 504, removes pending entry |
+| Intranet request fails | Client sends `connect_ack {success: false, error: ...}` |
 | CONNECT target unreachable | Client sends `connect_ack {success: false}`, Server returns 502 |
 | App disconnects mid-CONNECT | Server sends `close` message, Client closes its socket |
 | Control channel I/O error | Both sides log; Client auto-reconnects with exponential backoff (max 60s) |
@@ -137,10 +133,9 @@ Defaults (overridable via CLI args):
 | Proxy port | 8080 | server |
 | Server host | (required) | client |
 | Server control port | 7000 | client |
-| Request timeout | 30s | server |
+| Connect ack timeout | 30s | server |
 | Reconnect max interval | 60s | client |
 
 ## Dependencies
 
-- **Standard library only:** `socket`, `threading`, `http.server`, `urllib`, `json`, `struct`, `uuid`
-- **Client optional:** `requests` library (recommended for easier HTTPS certificate handling)
+- **Standard library only:** `socket`, `threading`, `json`, `struct`, `uuid`

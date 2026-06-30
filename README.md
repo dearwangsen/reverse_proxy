@@ -26,8 +26,8 @@ A lightweight HTTP/HTTPS reverse proxy tunnel written in pure Python. Designed f
 Inspired by [frp](https://github.com/fatedier/frp):
 
 - The **Windows client** initiates a persistent TCP connection to the Linux server (control channel).
-- When a Linux app sends an HTTP/HTTPS request to the local proxy port, the server forwards it to the Windows client over the control channel.
-- The Windows client performs the actual request against the private network and returns the response.
+- When a Linux app sends an HTTP/HTTPS request to the local proxy port, the server asks the Windows client to open a TCP connection to the target host.
+- Both request and response bodies are relayed as raw byte streams, so large or long-lived transfers such as `git clone` and `git push` do not need to be buffered in memory.
 - Multiple concurrent requests are multiplexed over a single control connection using unique request IDs.
 
 ## Features
@@ -37,15 +37,14 @@ Inspired by [frp](https://github.com/fatedier/frp):
 - Single persistent control connection with request-ID multiplexing
 - Auto-reconnect with exponential backoff on the client side
 - Heartbeat keepalive
-- Zero dependencies on the server side (Python 3.6+ stdlib only)
-- `requests` library recommended on the client side for robust HTTPS handling
+- Zero dependencies on both sides (Python 3.6+ stdlib only)
 
 ## Requirements
 
 | Side | Requirement |
 |------|-------------|
 | Server (Linux) | Python 3.6+ |
-| Client (Windows) | Python 3.6+, `pip install requests` |
+| Client (Windows) | Python 3.6+ |
 
 ## Quick Start
 
@@ -62,7 +61,6 @@ By default, it listens on:
 **2. Start the client on Windows:**
 
 ```cmd
-pip install requests
 python http_reverse_proxy_client.py <linux-server-ip>
 ```
 
@@ -114,9 +112,7 @@ Messages on the control channel use a simple length-prefixed framing:
 
 | Message type | Direction | Purpose |
 |---|---|---|
-| `http_request` | Server → Client | Plain HTTP request |
-| `http_response` | Client → Server | HTTP response |
-| `connect` | Server → Client | Open HTTPS CONNECT tunnel |
+| `connect` | Server → Client | Open target TCP connection |
 | `connect_ack` | Client → Server | Tunnel open result |
 | `data` | Bidirectional | Raw bytes for an active tunnel |
 | `close` | Bidirectional | Close a tunnel |
@@ -125,9 +121,8 @@ Messages on the control channel use a simple length-prefixed framing:
 ## Notes
 
 - The server accepts only **one** client connection at a time.
-- HTTPS traffic is tunneled transparently — TLS terminates at the intranet server, not at the proxy.
-- The `requests` library on the client side automatically bypasses Windows system proxy settings (`proxies={"http": None, "https": None}`), ensuring direct access to the private network.
-- Response compression (`gzip`, `deflate`) is handled transparently by the client — the downstream caller always receives plain bytes.
+- HTTP and HTTPS traffic are tunneled transparently. TLS terminates at the intranet server, not at the proxy.
+- Plain HTTP proxy requests are rewritten from absolute-form to origin-form before being sent upstream, then the body is relayed as raw bytes.
 
 ## License
 
